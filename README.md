@@ -56,7 +56,7 @@ X11 window ID of the target window.
 `-f, --file <file>`
 File whose contents will be typed into the window.
 
-Optional options
+### Optional options
 
 `--delay-character <ms>`
 Delay in milliseconds between each typed character.
