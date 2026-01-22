@@ -1,4 +1,4 @@
-# Create an output folder on Desktop or TEMP
+# Create an output folder on Desktop (change if needed)
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $baseDir = [Environment]::GetFolderPath('Desktop')
 if (-not (Test-Path $baseDir)) {
