@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Multi-Routing Traffic Visualizer
-Monitors and displays live traffic routing between LAN (eth0) and Internet (wlan0)
+Multi-Routing Traffic Visualizer - Dynamic Interface Version
+Monitors and displays live traffic routing between any number of network interfaces
 """
 
 import curses
@@ -10,8 +10,8 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime
 import subprocess
-import re
 import sys
+import argparse
 
 try:
     from scapy.all import sniff, IP, IPv6
@@ -22,33 +22,26 @@ except ImportError:
 
 
 class TrafficMonitor:
-    def __init__(self, lan_iface='eth0', wan_iface='wlan0'):
-        self.lan_iface = lan_iface
-        self.wan_iface = wan_iface
+    def __init__(self, interfaces):
+        if not interfaces:
+            print("Error: At least one interface must be specified")
+            sys.exit(1)
+            
+        self.interfaces = interfaces
         
-        # Traffic counters
-        self.stats = {
-            lan_iface: {
+        # Traffic counters - dynamically created for each interface
+        self.stats = {}
+        for iface in interfaces:
+            self.stats[iface] = {
                 'packets': 0,
                 'bytes': 0,
                 'destinations': defaultdict(int),
                 'protocols': defaultdict(int),
-                'recent_dsts': deque(maxlen=20)
-            },
-            wan_iface: {
-                'packets': 0,
-                'bytes': 0,
-                'destinations': defaultdict(int),
-                'protocols': defaultdict(int),
-                'recent_dsts': deque(maxlen=20)
+                'recent_dsts': deque(maxlen=10)
             }
-        }
         
         # Bandwidth tracking (last 5 seconds)
-        self.bandwidth = {
-            lan_iface: deque(maxlen=5),
-            wan_iface: deque(maxlen=5)
-        }
+        self.bandwidth = {iface: deque(maxlen=5) for iface in interfaces}
         
         # Locks for thread safety
         self.lock = threading.Lock()
@@ -57,6 +50,27 @@ class TrafficMonitor:
         # Routing table cache
         self.routes = []
         self.update_routing_table()
+        
+        # Validate interfaces
+        self.validate_interfaces()
+
+    def validate_interfaces(self):
+        """Check if interfaces exist on the system"""
+        try:
+            result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
+            available_ifaces = []
+            for line in result.stdout.split('\n'):
+                if ':' in line and not line.startswith(' '):
+                    iface_name = line.split(':')[1].strip().split('@')[0]
+                    available_ifaces.append(iface_name)
+            
+            for iface in self.interfaces:
+                if iface not in available_ifaces:
+                    print(f"Warning: Interface '{iface}' not found on system")
+                    print(f"Available interfaces: {', '.join(available_ifaces)}")
+                    
+        except Exception as e:
+            print(f"Warning: Could not validate interfaces: {e}")
 
     def update_routing_table(self):
         """Fetch current routing table"""
@@ -111,45 +125,38 @@ class TrafficMonitor:
         return process_packet
 
     def start_sniffing(self):
-        """Start packet capture on both interfaces"""
-        # Start sniffing threads
-        lan_thread = threading.Thread(
-            target=lambda: sniff(
-                iface=self.lan_iface,
-                prn=self.packet_handler(self.lan_iface),
-                store=False,
-                stop_filter=lambda _: not self.running
-            ),
-            daemon=True
-        )
+        """Start packet capture on all interfaces"""
+        threads = []
         
-        wan_thread = threading.Thread(
-            target=lambda: sniff(
-                iface=self.wan_iface,
-                prn=self.packet_handler(self.wan_iface),
-                store=False,
-                stop_filter=lambda _: not self.running
-            ),
-            daemon=True
-        )
-        
-        lan_thread.start()
-        wan_thread.start()
+        for iface in self.interfaces:
+            thread = threading.Thread(
+                target=lambda i=iface: sniff(
+                    iface=i,
+                    prn=self.packet_handler(i),
+                    store=False,
+                    stop_filter=lambda _: not self.running
+                ),
+                daemon=True,
+                name=f"Sniffer-{iface}"
+            )
+            thread.start()
+            threads.append(thread)
         
         # Bandwidth calculation thread
         bw_thread = threading.Thread(target=self.calculate_bandwidth, daemon=True)
         bw_thread.start()
+        threads.append(bw_thread)
         
-        return lan_thread, wan_thread, bw_thread
+        return threads
 
     def calculate_bandwidth(self):
         """Calculate bandwidth every second"""
-        last_bytes = {self.lan_iface: 0, self.wan_iface: 0}
+        last_bytes = {iface: 0 for iface in self.interfaces}
         
         while self.running:
             time.sleep(1)
             with self.lock:
-                for iface in [self.lan_iface, self.wan_iface]:
+                for iface in self.interfaces:
                     current_bytes = self.stats[iface]['bytes']
                     bps = current_bytes - last_bytes[iface]
                     self.bandwidth[iface].append(bps)
@@ -180,6 +187,19 @@ class TrafficMonitor:
         else:
             return f"{bytes_val/(1024*1024*1024):.2f} GB"
 
+    def get_total_stats(self):
+        """Get combined stats across all interfaces"""
+        total_packets = sum(self.stats[iface]['packets'] for iface in self.interfaces)
+        total_bytes = sum(self.stats[iface]['bytes'] for iface in self.interfaces)
+        return total_packets, total_bytes
+
+
+def get_interface_color(index, total):
+    """Assign colors to interfaces dynamically"""
+    # Color pairs: 1=green, 2=cyan, 6=blue, 7=white, 8=magenta_alt
+    colors = [1, 2, 6, 8, 7]  # Cycle through available colors
+    return colors[index % len(colors)]
+
 
 def draw_ui(stdscr, monitor):
     """Draw the curses UI"""
@@ -189,13 +209,18 @@ def draw_ui(stdscr, monitor):
     
     # Initialize colors
     curses.start_color()
-    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)   # LAN
-    curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)    # WAN
-    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # Headers
-    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)     # Alerts
-    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK) # Info
+    curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)
+    curses.init_pair(5, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
+    curses.init_pair(6, curses.COLOR_BLUE, curses.COLOR_BLACK)
+    curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    curses.init_pair(8, curses.COLOR_MAGENTA, curses.COLOR_BLACK)
     
     last_route_update = time.time()
+    scroll_offset = 0
+    max_scroll = 0
     
     while monitor.running:
         try:
@@ -203,9 +228,13 @@ def draw_ui(stdscr, monitor):
             height, width = stdscr.getmaxyx()
             
             # Title
-            title = "═══ MULTI-ROUTING TRAFFIC MONITOR ═══"
-            stdscr.addstr(0, (width - len(title)) // 2, title, curses.color_pair(3) | curses.A_BOLD)
-            stdscr.addstr(1, (width - 40) // 2, f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", curses.color_pair(5))
+            title = "═══ MULTI-INTERFACE TRAFFIC MONITOR ═══"
+            if len(title) < width:
+                stdscr.addstr(0, (width - len(title)) // 2, title, curses.color_pair(3) | curses.A_BOLD)
+            
+            timestamp = f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            if len(timestamp) < width:
+                stdscr.addstr(1, (width - len(timestamp)) // 2, timestamp, curses.color_pair(5))
             
             row = 3
             
@@ -215,57 +244,94 @@ def draw_ui(stdscr, monitor):
                 last_route_update = time.time()
             
             with monitor.lock:
+                # Summary bar
+                total_packets, total_bytes = monitor.get_total_stats()
+                summary = f"Total: {total_packets:,} packets │ {monitor.format_bytes(total_bytes)} │ {len(monitor.interfaces)} interface(s)"
+                if len(summary) < width - 4:
+                    stdscr.addstr(row, 2, summary, curses.color_pair(3))
+                row += 2
+                
                 # Interface Statistics
-                stdscr.addstr(row, 2, "┌─ INTERFACE STATISTICS " + "─" * (width - 28) + "┐", curses.color_pair(3))
+                header = "┌─ INTERFACE STATISTICS " + "─" * (width - 28) + "┐"
+                if len(header) <= width - 2:
+                    stdscr.addstr(row, 2, header[:width-2], curses.color_pair(3))
                 row += 1
                 
-                for iface_idx, iface in enumerate([monitor.lan_iface, monitor.wan_iface]):
-                    color = curses.color_pair(1) if iface_idx == 0 else curses.color_pair(2)
-                    label = "LAN (eth0)" if iface_idx == 0 else "WAN (wlan0)"
+                # Calculate content height for scrolling
+                content_start_row = row
+                virtual_row = 0  # Track virtual position for scrolling
+                
+                for iface_idx, iface in enumerate(monitor.interfaces):
+                    color_idx = get_interface_color(iface_idx, len(monitor.interfaces))
+                    color = curses.color_pair(color_idx)
                     
                     stats = monitor.stats[iface]
-                    stdscr.addstr(row, 4, f"├─ {label}:", color | curses.A_BOLD)
-                    row += 1
                     
-                    stdscr.addstr(row, 6, f"Packets: {stats['packets']:>10,}  │  ", color)
-                    stdscr.addstr(f"Bytes: {monitor.format_bytes(stats['bytes']):>12}  │  ", color)
-                    stdscr.addstr(f"Rate: {monitor.get_avg_bandwidth(iface):>12}", color)
-                    row += 1
+                    # Only draw if within visible area (accounting for scroll)
+                    display_row = row + virtual_row - scroll_offset
                     
-                    # Top protocols
-                    if stats['protocols']:
-                        proto_str = "Protocols: " + ", ".join([f"{k}({v})" for k, v in 
-                                                                 sorted(stats['protocols'].items(), 
-                                                                       key=lambda x: x[1], reverse=True)[:5]])
-                        stdscr.addstr(row, 6, proto_str[:width-8], color)
-                    row += 1
+                    if display_row >= content_start_row and display_row < height - 12:
+                        iface_header = f"├─ {iface}:"
+                        stdscr.addstr(display_row, 4, iface_header, color | curses.A_BOLD)
+                    virtual_row += 1
+                    
+                    # Packet stats line
+                    display_row = row + virtual_row - scroll_offset
+                    if display_row >= content_start_row and display_row < height - 12:
+                        stats_line = f"Packets: {stats['packets']:>10,}  │  Bytes: {monitor.format_bytes(stats['bytes']):>12}  │  Rate: {monitor.get_avg_bandwidth(iface):>12}"
+                        stdscr.addstr(display_row, 6, stats_line[:width-8], color)
+                    virtual_row += 1
+                    
+                    # Protocol line
+                    display_row = row + virtual_row - scroll_offset
+                    if display_row >= content_start_row and display_row < height - 12:
+                        if stats['protocols']:
+                            proto_str = "Protocols: " + ", ".join([f"{k}({v})" for k, v in 
+                                                                     sorted(stats['protocols'].items(), 
+                                                                           key=lambda x: x[1], reverse=True)[:5]])
+                            stdscr.addstr(display_row, 6, proto_str[:width-8], color)
+                    virtual_row += 1
                     
                     # Recent destinations
-                    stdscr.addstr(row, 6, "Recent Destinations:", color)
-                    row += 1
+                    display_row = row + virtual_row - scroll_offset
+                    if display_row >= content_start_row and display_row < height - 12:
+                        stdscr.addstr(display_row, 6, "Recent Destinations:", color)
+                    virtual_row += 1
+                    
                     for dst, ts in list(stats['recent_dsts'])[-5:]:
-                        age = int(time.time() - ts)
-                        dst_str = f"    • {dst:<40} ({age}s ago)"
-                        if row < height - 10 and len(dst_str) < width - 8:
-                            stdscr.addstr(row, 6, dst_str[:width-8], color)
-                            row += 1
+                        display_row = row + virtual_row - scroll_offset
+                        if display_row >= content_start_row and display_row < height - 12:
+                            age = int(time.time() - ts)
+                            dst_str = f"    • {dst:<40} ({age}s ago)"
+                            stdscr.addstr(display_row, 6, dst_str[:width-8], color)
+                        virtual_row += 1
                     
-                    row += 1
+                    virtual_row += 1  # Spacing between interfaces
                 
-                # Routing Table
-                if row < height - 10:
-                    stdscr.addstr(row, 2, "┌─ ROUTING TABLE " + "─" * (width - 21) + "┐", curses.color_pair(3))
-                    row += 1
+                max_scroll = max(0, virtual_row - (height - content_start_row - 12))
+                
+                # Routing Table section
+                route_row = height - 11
+                if route_row > row + 2:
+                    header = "┌─ ROUTING TABLE " + "─" * (width - 21) + "┐"
+                    if len(header) <= width - 2:
+                        stdscr.addstr(route_row, 2, header[:width-2], curses.color_pair(3))
+                    route_row += 1
                     
-                    for route in monitor.routes[:min(8, height - row - 3)]:
-                        if row < height - 3 and len(route) < width - 8:
-                            stdscr.addstr(row, 4, route[:width-6], curses.color_pair(5))
-                            row += 1
+                    routes_to_show = min(6, height - route_row - 3)
+                    for i, route in enumerate(monitor.routes[:routes_to_show]):
+                        if route_row + i < height - 3:
+                            stdscr.addstr(route_row + i, 4, route[:width-6], curses.color_pair(5))
             
-            # Footer
+            # Footer with scroll indicator
             if height > 5:
-                footer = "Press 'q' to quit | Press 'r' to reset stats"
-                stdscr.addstr(height - 2, (width - len(footer)) // 2, footer, curses.color_pair(3))
+                if max_scroll > 0:
+                    footer = f"↑/↓ to scroll ({scroll_offset}/{max_scroll}) | 'q' quit | 'r' reset | 'h' home | 'e' end"
+                else:
+                    footer = "Press 'q' to quit | Press 'r' to reset stats"
+                
+                if len(footer) < width:
+                    stdscr.addstr(height - 2, (width - len(footer)) // 2, footer[:width-2], curses.color_pair(3))
             
             stdscr.refresh()
             
@@ -276,12 +342,20 @@ def draw_ui(stdscr, monitor):
                 break
             elif key == ord('r') or key == ord('R'):
                 with monitor.lock:
-                    for iface in [monitor.lan_iface, monitor.wan_iface]:
+                    for iface in monitor.interfaces:
                         monitor.stats[iface]['packets'] = 0
                         monitor.stats[iface]['bytes'] = 0
                         monitor.stats[iface]['destinations'].clear()
                         monitor.stats[iface]['protocols'].clear()
                         monitor.stats[iface]['recent_dsts'].clear()
+            elif key == curses.KEY_UP:
+                scroll_offset = max(0, scroll_offset - 1)
+            elif key == curses.KEY_DOWN:
+                scroll_offset = min(max_scroll, scroll_offset + 1)
+            elif key == ord('h') or key == ord('H'):
+                scroll_offset = 0  # Home
+            elif key == ord('e') or key == ord('E'):
+                scroll_offset = max_scroll  # End
             
         except curses.error:
             pass  # Ignore curses errors (usually from small terminal)
@@ -291,30 +365,53 @@ def draw_ui(stdscr, monitor):
 
 
 def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser(
+        description='Multi-Interface Traffic Monitor - Monitor packet routing across network interfaces',
+        epilog='Examples:\n'
+               '  sudo %(prog)s eth0 wlan0\n'
+               '  sudo %(prog)s eth0 eth1 wlan0 lo\n'
+               '  sudo %(prog)s wlan0\n',
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-i', '--interfaces', nargs='+', metavar='INTERFACE',
+                        help='Network interface(s) to monitor (e.g., eth0, wlan0, lo)')
+    group.add_argument('-l', '--list', action='store_true',
+                        help='List available network interfaces and exit')
+    
+    args = parser.parse_args()
+    
+    # List interfaces if requested
+    if args.list:
+        try:
+            result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
+            print("Available network interfaces:")
+            for line in result.stdout.split('\n'):
+                if ':' in line and not line.startswith(' '):
+                    iface_name = line.split(':')[1].strip().split('@')[0]
+                    print(f"  - {iface_name}")
+        except Exception as e:
+            print(f"Error listing interfaces: {e}")
+        sys.exit(0)
+    
+    interfaces = args.interfaces
+
     # Check if running as root
     if subprocess.run(['id', '-u'], capture_output=True, text=True).stdout.strip() != '0':
         print("Error: This script must be run as root (use sudo)")
         print("Reason: Packet capture requires root privileges")
         sys.exit(1)
     
-    # Parse arguments
-    lan_iface = 'eth0'
-    wan_iface = 'wlan0'
     
-    if len(sys.argv) > 1:
-        lan_iface = sys.argv[1]
-    if len(sys.argv) > 2:
-        wan_iface = sys.argv[2]
-    
-    print(f"Starting Multi-Routing Monitor...")
-    print(f"LAN Interface: {lan_iface}")
-    print(f"WAN Interface: {wan_iface}")
+    print(f"Starting Multi-Interface Traffic Monitor...")
+    print(f"Monitoring {len(interfaces)} interface(s): {', '.join(interfaces)}")
     print(f"Initializing packet capture...")
     
-    monitor = TrafficMonitor(lan_iface, wan_iface)
+    monitor = TrafficMonitor(interfaces)
     
     # Start packet capture
-    threads = monitor.start_sniffing()
+    monitor.start_sniffing()
     
     # Give it a moment to start
     time.sleep(1)
