@@ -68,9 +68,11 @@ class TrafficMonitor:
                 if iface not in available_ifaces:
                     print(f"Warning: Interface '{iface}' not found on system")
                     print(f"Available interfaces: {', '.join(available_ifaces)}")
+                    raise
                     
         except Exception as e:
             print(f"Warning: Could not validate interfaces: {e}")
+            sys.exit(0)
 
     def update_routing_table(self):
         """Fetch current routing table"""
