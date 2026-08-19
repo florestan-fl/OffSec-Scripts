@@ -516,7 +516,7 @@ function Invoke-PortScan {
         }
     }
     
-    $sortedResults = $results.ToArray() | Sort-Object Port
+    $sortedResults = @($results.ToArray() | Sort-Object Port)
     
     foreach ($result in $sortedResults) {
         $serviceInfo = Get-ServiceNameFromDB -Database $Script:Config.ServiceDatabase -Port $result.Port
@@ -529,11 +529,11 @@ function Invoke-PortScan {
         }
         
         $line = "{0,-10} {1,-10} {2,-22} {3}" -f "$($result.Port)/tcp", $result.State, $serviceInfo.Name, $descDisplay
-        Write-Host $line -ForegroundColor $color
+        Write-Host "Line:" $line -ForegroundColor $color
     }
     
     Write-Host ""
-    $openCount = ($sortedResults | Where-Object { $_.State -eq 'open' }).Count
+    $openCount = @($sortedResults | Where-Object { $_.State -eq 'open' }).Count
     Write-Log "Found $openCount open port(s)" -Level Info
     
     return $sortedResults
